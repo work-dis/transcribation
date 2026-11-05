@@ -25,7 +25,9 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    Document,
     Message,
+    Video,
 )
 from apps.transcriber_bot.storage import get_language, init_db, recent_transcriptions, save_transcription, set_language
 
@@ -38,6 +40,8 @@ MAX_FILE_BYTES = int(os.environ.get("MAX_TRANSCRIPTION_FILE_MB", "20")) * 1024 *
 RATE_LIMIT_COUNT = int(os.environ.get("TRANSCRIPTION_RATE_LIMIT", "10"))
 RATE_LIMIT_WINDOW = 60 * 60
 MAX_TELEGRAM_TEXT = 4096
+SUPPORTED_AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".webm", ".ogg", ".flac", ".aac"}
+SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 
 router = Router()
 processing_slots = asyncio.Semaphore(2)
@@ -47,9 +51,24 @@ recent_requests: dict[int, deque[float]] = defaultdict(deque)
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Как это работает", callback_data="help")],
-            [InlineKeyboardButton(text="Приватность", callback_data="privacy")],
+            [
+                InlineKeyboardButton(text="🎙 Новая расшифровка", callback_data="new"),
+                InlineKeyboardButton(text="🕘 История", callback_data="history"),
+            ],
+            [
+                InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
+                InlineKeyboardButton(text="🔒 Приватность", callback_data="privacy"),
+            ],
+            [InlineKeyboardButton(text="❓ Как пользоваться", callback_data="help")],
         ]
+    )
+
+
+def menu_text() -> str:
+    return (
+        "<b>VoiceType</b>\n\n"
+        "Отправьте голосовое сообщение — я превращу его в аккуратный текст.\n\n"
+        "Выберите раздел или сразу отправьте запись:"
     )
 
 
@@ -92,13 +111,30 @@ def split_text(text: str, limit: int = MAX_TELEGRAM_TEXT) -> list[str]:
     return [text[offset : offset + limit] for offset in range(0, len(text), limit)]
 
 
-def audio_details(message: Message) -> tuple[str, str, int | None] | None:
-    voice: Audio | None = message.voice or message.audio
-    if not voice:
+def audio_details(message: Message) -> tuple[str, str, int | None, bool] | None:
+    media: Audio | Document | Video | None = message.voice or message.audio or message.document or message.video
+    if not media:
         return None
-    filename = getattr(voice, "file_name", None) or f"voice-{voice.file_unique_id}.ogg"
-    mime_type = getattr(voice, "mime_type", None) or "audio/ogg"
-    return voice.file_id, filename, voice.file_size
+    is_video = bool(message.video) or Path(getattr(media, "file_name", "") or "").suffix.lower() in SUPPORTED_VIDEO_SUFFIXES
+    fallback_suffix = ".mp4" if message.video else ".ogg"
+    filename = getattr(media, "file_name", None) or f"recording-{media.file_unique_id}{fallback_suffix}"
+    return media.file_id, filename, media.file_size, is_video
+
+
+async def extract_audio(path: Path, temp_dir: str) -> tuple[Path, str]:
+    if path.suffix.lower() not in SUPPORTED_VIDEO_SUFFIXES:
+        return path, path.name
+    output = Path(temp_dir) / "conference-audio.mp3"
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-nostdin", "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", str(output),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0 or not output.exists():
+        detail = stderr.decode(errors="replace")[-300:].replace("\n", " ")
+        raise RuntimeError(f"Не удалось извлечь аудио из видео: {detail}")
+    return output, output.name
 
 
 async def transcribe_file(path: Path, filename: str, language: str = "ru") -> str:
@@ -141,6 +177,8 @@ def _mime_for(filename: str) -> str:
         ".wav": "audio/wav",
         ".webm": "audio/webm",
         ".ogg": "audio/ogg",
+        ".flac": "audio/flac",
+        ".aac": "audio/aac",
     }.get(suffix, "application/octet-stream")
 
 
@@ -152,10 +190,8 @@ async def send_transcript(message: Message, text: str) -> None:
 @router.message(CommandStart())
 async def start(message: Message) -> None:
     await message.answer(
-        "<b>VoiceType</b>\n\n"
-        "Отправьте голосовое сообщение — я превращу его в аккуратный русский текст.\n\n"
-        "<i>Аудио обрабатывается только для текущей расшифровки и затем удаляется.</i>",
-        reply_markup=reply_menu(),
+        menu_text(),
+        reply_markup=main_keyboard(),
     )
 
 
@@ -174,7 +210,7 @@ async def help_command(message: Message) -> None:
 @router.message(Command("menu"))
 @router.message(F.text.in_({"❓ Помощь", "Помощь"}))
 async def menu_command(message: Message) -> None:
-    await help_command(message)
+    await message.answer(menu_text(), reply_markup=main_keyboard())
 
 
 @router.message(Command("new"))
@@ -183,6 +219,66 @@ async def new_transcription(message: Message) -> None:
     await message.answer(
         "Готово. Отправьте голосовое сообщение или аудиофайл — я верну текст.",
         reply_markup=reply_menu(),
+    )
+
+
+@router.callback_query(F.data == "menu")
+async def menu_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(menu_text(), reply_markup=main_keyboard())
+
+
+@router.callback_query(F.data == "new")
+async def new_callback(callback: CallbackQuery) -> None:
+    await callback.answer("Жду голосовое")
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Новая расшифровка</b>\n\nОтправьте голосовое, аудиофайл или запись Zoom — я верну текст.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="← Главное меню", callback_data="menu")]]
+            ),
+        )
+
+
+@router.callback_query(F.data == "history")
+async def history_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if not callback.from_user or not callback.message:
+        return
+    rows = await recent_transcriptions(callback.from_user.id)
+    if not rows:
+        text = "<b>История</b>\n\nПока здесь пусто. Отправьте первое голосовое сообщение."
+    else:
+        lines = ["<b>Последние расшифровки</b>", ""]
+        for created_at, transcript in rows:
+            preview = html.escape(transcript.replace("\n", " ")[:240])
+            lines.append(f"<i>{html.escape(created_at[5:16])}</i>\n{preview}")
+        text = "\n\n".join(lines)
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="← Главное меню", callback_data="menu")]]
+        ),
+    )
+
+
+@router.callback_query(F.data == "settings")
+async def settings_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if not callback.from_user or not callback.message:
+        return
+    language = await get_language(callback.from_user.id)
+    label = "русский" if language == "ru" else "автоопределение"
+    await callback.message.edit_text(
+        f"<b>Настройки</b>\n\nЯзык распознавания: <b>{label}</b>\n\nВыберите режим:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=("✅ Русский" if language == "ru" else "Русский"), callback_data="lang:ru")],
+                [InlineKeyboardButton(text=("✅ Автоопределение" if language == "auto" else "Автоопределение"), callback_data="lang:auto")],
+                [InlineKeyboardButton(text="← Главное меню", callback_data="menu")],
+            ]
+        ),
     )
 
 
@@ -245,8 +341,8 @@ async def help_callback(callback: CallbackQuery) -> None:
     if callback.message:
         await callback.message.edit_text(
             "<b>Как пользоваться</b>\n\n"
-            "Отправьте голосовое сообщение или аудиофайл — бот распознает русскую речь и вернёт текст.\n\n"
-            "Лимит: 20 МБ на файл.",
+            "Отправьте голосовое, аудиофайл или видеозапись Zoom — бот извлечёт речь и вернёт текст.\n\n"
+            "Поддерживаются MP3, M4A, WAV, OGG, FLAC, AAC, MP4, MOV, MKV и AVI. Лимит: 20 МБ на файл.",
             reply_markup=main_keyboard(),
         )
 
@@ -264,12 +360,18 @@ async def privacy_callback(callback: CallbackQuery) -> None:
         )
 
 
-@router.message(F.voice | F.audio)
+@router.message(F.voice | F.audio | F.document | F.video)
 async def transcribe_message(message: Message, bot: Bot) -> None:
     details = audio_details(message)
     if not details:
         return
-    file_id, filename, file_size = details
+    file_id, filename, file_size, is_video = details
+    suffix = Path(filename).suffix.lower()
+    if message.document and suffix not in SUPPORTED_AUDIO_SUFFIXES | SUPPORTED_VIDEO_SUFFIXES:
+        await message.answer(
+            "Похоже, это не аудио- или видеофайл. Отправьте MP3, M4A, WAV, OGG, FLAC, AAC, MP4, MOV или MKV."
+        )
+        return
     if file_size and file_size > MAX_FILE_BYTES:
         await message.answer("Файл больше 20 МБ. Отправьте более короткое голосовое сообщение.")
         return
@@ -279,7 +381,7 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id if message.from_user else message.chat.id
     language = await get_language(user_id)
 
-    status = await message.answer("<b>Принято</b>\nСкачиваю аудио…")
+    status = await message.answer("<b>Принято</b>\nСкачиваю запись…")
     try:
         async with processing_slots:
             await status.edit_text("<b>В работе</b>\nРаспознаю русскую речь…")
@@ -289,7 +391,8 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
             with TemporaryDirectory(prefix="voicetype-") as temp_dir:
                 target = Path(temp_dir) / Path(filename).name
                 await bot.download_file(telegram_file.file_path, destination=target)
-                transcript = await transcribe_file(target, target.name, language)
+                audio_path, audio_name = await extract_audio(target, temp_dir) if is_video else (target, target.name)
+                transcript = await transcribe_file(audio_path, audio_name, language)
         await save_transcription(user_id, message.chat.id, transcript)
         await status.delete()
         await send_transcript(message, transcript)

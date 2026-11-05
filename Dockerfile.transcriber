@@ -5,7 +5,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY requirements.transcriber.txt .
-RUN pip install --no-cache-dir -r requirements.transcriber.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.transcriber.txt
 COPY apps/transcriber_bot ./apps/transcriber_bot
 
 RUN useradd --create-home --uid 10001 appuser
