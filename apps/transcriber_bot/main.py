@@ -32,6 +32,7 @@ from aiogram.types import (
     Document,
     Message,
     Video,
+    WebAppInfo,
 )
 from apps.transcriber_bot.storage import (
     get_language,
@@ -51,6 +52,7 @@ TRANSCRIPTION_MODEL = os.environ.get("TRANSCRIPTION_MODEL", "openai/whisper-larg
 CONFERENCE_MODEL = os.environ.get("CONFERENCE_MODEL", "elevenlabs/scribe-v2")
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "openai/gpt-4o-mini")
 WEB_BASE_URL = os.environ.get("WEB_BASE_URL", "https://telegram.org")
+MINI_APP_URL = os.environ.get("MINI_APP_URL", "").strip()
 MAX_FILE_BYTES = int(os.environ.get("MAX_TRANSCRIPTION_FILE_MB", "20")) * 1024 * 1024
 RATE_LIMIT_COUNT = int(os.environ.get("TRANSCRIPTION_RATE_LIMIT", "10"))
 RATE_LIMIT_WINDOW = 60 * 60
@@ -78,8 +80,7 @@ recent_requests: dict[int, deque[float]] = defaultdict(deque)
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    rows = [
             [
                 InlineKeyboardButton(text="🎙 Новая расшифровка", callback_data="new"),
                 InlineKeyboardButton(text="🕘 История", callback_data="history"),
@@ -93,6 +94,10 @@ def main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="💰 Мой баланс", callback_data="balance")],
             [InlineKeyboardButton(text="❓ Как пользоваться", callback_data="help")],
         ]
+    if MINI_APP_URL:
+        rows.insert(0, [InlineKeyboardButton(text="📚 Открыть кабинет", web_app=WebAppInfo(url=MINI_APP_URL))])
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
     )
 
 
