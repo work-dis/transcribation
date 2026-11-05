@@ -25,6 +25,21 @@ async def init_db() -> None:
                 text TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS balances (
+                user_id INTEGER PRIMARY KEY,
+                minutes INTEGER NOT NULL DEFAULT 0,
+                ai_actions INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                plan_code TEXT NOT NULL,
+                charge_id TEXT NOT NULL UNIQUE,
+                stars INTEGER NOT NULL,
+                minutes INTEGER NOT NULL,
+                ai_actions INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE INDEX IF NOT EXISTS idx_transcriptions_user
                 ON transcriptions(user_id, created_at DESC);
             """
@@ -99,3 +114,73 @@ async def recent_transcriptions(user_id: int, limit: int = 5) -> list[tuple[str,
             (user_id, limit),
         )
         return await cursor.fetchall()
+
+
+async def get_balance(user_id: int) -> tuple[int, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT minutes, ai_actions FROM balances WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+    return (int(row[0]), int(row[1])) if row else (0, 0)
+
+
+async def charge_minutes(user_id: int, minutes: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE balances SET minutes = minutes - ? WHERE user_id = ? AND minutes >= ?",
+            (minutes, user_id, minutes),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def charge_usage(user_id: int, minutes: int, ai_actions: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE balances SET minutes = minutes - ?, ai_actions = ai_actions - ? "
+            "WHERE user_id = ? AND minutes >= ? AND ai_actions >= ?",
+            (minutes, ai_actions, user_id, minutes, ai_actions),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def refund_minutes(user_id: int, minutes: int) -> None:
+    await add_balance(user_id, minutes, 0)
+
+
+async def refund_usage(user_id: int, minutes: int, ai_actions: int) -> None:
+    await add_balance(user_id, minutes, ai_actions)
+
+
+async def add_balance(user_id: int, minutes: int, ai_actions: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO balances(user_id, minutes, ai_actions) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET minutes = minutes + excluded.minutes, "
+            "ai_actions = ai_actions + excluded.ai_actions",
+            (user_id, minutes, ai_actions),
+        )
+        await db.commit()
+
+
+async def record_payment(
+    user_id: int, plan_code: str, charge_id: str, stars: int, minutes: int, ai_actions: int
+) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO payments(user_id, plan_code, charge_id, stars, minutes, ai_actions) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, plan_code, charge_id, stars, minutes, ai_actions),
+            )
+            await db.execute(
+                "INSERT INTO balances(user_id, minutes, ai_actions) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET minutes = minutes + excluded.minutes, "
+                "ai_actions = ai_actions + excluded.ai_actions",
+                (user_id, minutes, ai_actions),
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            await db.rollback()
+            return False

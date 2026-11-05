@@ -6,6 +6,7 @@ import asyncio
 import html
 import json
 import logging
+import math
 import os
 import time
 from collections import defaultdict, deque
@@ -25,6 +26,8 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    LabeledPrice,
+    PreCheckoutQuery,
     ReplyKeyboardMarkup,
     Document,
     Message,
@@ -39,6 +42,7 @@ from apps.transcriber_bot.storage import (
     set_language,
     set_mode,
 )
+from apps.transcriber_bot.storage import charge_usage, get_balance, record_payment, refund_usage
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -51,8 +55,22 @@ MAX_FILE_BYTES = int(os.environ.get("MAX_TRANSCRIPTION_FILE_MB", "20")) * 1024 *
 RATE_LIMIT_COUNT = int(os.environ.get("TRANSCRIPTION_RATE_LIMIT", "10"))
 RATE_LIMIT_WINDOW = 60 * 60
 MAX_TELEGRAM_TEXT = 4096
+ALLOWED_USER_IDS = {
+    int(value.strip())
+    for value in os.environ.get("ALLOWED_USER_IDS", "").split(",")
+    if value.strip().isdigit()
+}
 SUPPORTED_AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".webm", ".ogg", ".flac", ".aac"}
 SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+
+PLANS = {
+    "monthly_5": {"title": "5 часов + 60 AI-действий / месяц", "stars": 235, "minutes": 300, "actions": 60, "monthly": True},
+    "monthly_12": {"title": "12 часов + 300 AI-действий / месяц", "stars": 475, "minutes": 720, "actions": 300, "monthly": True},
+    "monthly_40": {"title": "40 часов + 1000 AI-действий / месяц", "stars": 1425, "minutes": 2400, "actions": 1000, "monthly": True},
+    "one_1": {"title": "1 час + 60 AI-действий", "stars": 235, "minutes": 60, "actions": 60, "monthly": False},
+    "one_3": {"title": "3 часа + 180 AI-действий", "stars": 475, "minutes": 180, "actions": 180, "monthly": False},
+    "one_10": {"title": "10 часов + 600 AI-действий", "stars": 1425, "minutes": 600, "actions": 600, "monthly": False},
+}
 
 router = Router()
 processing_slots = asyncio.Semaphore(2)
@@ -71,6 +89,8 @@ def main_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🔒 Приватность", callback_data="privacy"),
             ],
             [InlineKeyboardButton(text="🗣 Конференция и summary", callback_data="conference")],
+            [InlineKeyboardButton(text="💳 Тарифы и оплата", callback_data="plans")],
+            [InlineKeyboardButton(text="💰 Мой баланс", callback_data="balance")],
             [InlineKeyboardButton(text="❓ Как пользоваться", callback_data="help")],
         ]
     )
@@ -81,6 +101,24 @@ def menu_text() -> str:
         "<b>VoiceType</b>\n\n"
         "Отправьте голосовое сообщение — я превращу его в аккуратный текст.\n\n"
         "Выберите раздел или сразу отправьте запись:"
+    )
+
+
+def is_allowed(user_id: int) -> bool:
+    return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
+
+
+def plans_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="5 ч + 60 AI / месяц — 235 ⭐", callback_data="buy:monthly_5")],
+            [InlineKeyboardButton(text="12 ч + 300 AI / месяц — 475 ⭐", callback_data="buy:monthly_12")],
+            [InlineKeyboardButton(text="40 ч + 1000 AI / месяц — 1425 ⭐", callback_data="buy:monthly_40")],
+            [InlineKeyboardButton(text="1 ч + 60 AI — 235 ⭐", callback_data="buy:one_1")],
+            [InlineKeyboardButton(text="3 ч + 180 AI — 475 ⭐", callback_data="buy:one_3")],
+            [InlineKeyboardButton(text="10 ч + 600 AI — 1425 ⭐", callback_data="buy:one_10")],
+            [InlineKeyboardButton(text="← Главное меню", callback_data="menu")],
+        ]
     )
 
 
@@ -137,14 +175,14 @@ def split_text(text: str, limit: int = MAX_TELEGRAM_TEXT) -> list[str]:
     return [text[offset : offset + limit] for offset in range(0, len(text), limit)]
 
 
-def audio_details(message: Message) -> tuple[str, str, int | None, bool] | None:
+def audio_details(message: Message) -> tuple[str, str, int | None, bool, int | None] | None:
     media: Audio | Document | Video | None = message.voice or message.audio or message.document or message.video
     if not media:
         return None
     is_video = bool(message.video) or Path(getattr(media, "file_name", "") or "").suffix.lower() in SUPPORTED_VIDEO_SUFFIXES
     fallback_suffix = ".mp4" if message.video else ".ogg"
     filename = getattr(media, "file_name", None) or f"recording-{media.file_unique_id}{fallback_suffix}"
-    return media.file_id, filename, media.file_size, is_video
+    return media.file_id, filename, media.file_size, is_video, getattr(media, "duration", None)
 
 
 async def extract_audio(path: Path, temp_dir: str) -> tuple[Path, str]:
@@ -261,6 +299,9 @@ async def send_transcript(message: Message, text: str) -> None:
 
 @router.message(CommandStart())
 async def start(message: Message) -> None:
+    if message.from_user and not is_allowed(message.from_user.id):
+        await message.answer("Доступ к боту пока не открыт для этого аккаунта.")
+        return
     await message.answer(
         menu_text(),
         reply_markup=main_keyboard(),
@@ -297,8 +338,110 @@ async def new_transcription(message: Message) -> None:
 @router.callback_query(F.data == "menu")
 async def menu_callback(callback: CallbackQuery) -> None:
     await callback.answer()
-    if callback.message:
+    if callback.message and is_allowed(callback.from_user.id):
         await callback.message.edit_text(menu_text(), reply_markup=main_keyboard())
+
+
+@router.callback_query(F.data == "plans")
+async def plans_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message and is_allowed(callback.from_user.id):
+        await callback.message.edit_text(
+            "<b>Тарифы и оплата</b>\n\nВыберите пакет. Оплата проходит в Telegram Stars, минуты и AI-действия не сгорают для разовой покупки.",
+            reply_markup=plans_keyboard(),
+        )
+
+
+@router.callback_query(F.data == "balance")
+async def balance_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message and is_allowed(callback.from_user.id):
+        minutes, actions = await get_balance(callback.from_user.id)
+        await callback.message.edit_text(
+            f"<b>Мой баланс</b>\n\nМинуты расшифровки: <b>{minutes}</b>\nAI-действия: <b>{actions}</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="plans")],
+                    [InlineKeyboardButton(text="← Главное меню", callback_data="menu")],
+                ]
+            ),
+        )
+
+
+@router.callback_query(F.data.startswith("buy:"))
+async def buy_callback(callback: CallbackQuery, bot: Bot) -> None:
+    await callback.answer()
+    if not callback.message or not is_allowed(callback.from_user.id):
+        return
+    code = callback.data.split(":", 1)[1]
+    plan = PLANS.get(code)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+    invoice_kwargs = {
+        "chat_id": callback.message.chat.id,
+        "title": plan["title"],
+        "description": f"{plan['minutes'] // 60} ч расшифровки и {plan['actions']} AI-действий",
+        "payload": f"plan:{code}",
+        "currency": "XTR",
+        "prices": [LabeledPrice(label=plan["title"], amount=plan["stars"])],
+        "provider_token": "",
+    }
+    if plan["monthly"]:
+        invoice_kwargs["subscription_period"] = 2592000
+    await bot.send_invoice(**invoice_kwargs)
+
+
+@router.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery) -> None:
+    code = query.invoice_payload.removeprefix("plan:")
+    plan = PLANS.get(code)
+    if not plan or not is_allowed(query.from_user.id) or query.total_amount != plan["stars"]:
+        await query.answer(ok=False, error_message="Тариф недоступен. Откройте меню оплаты ещё раз.")
+        return
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def successful_payment(message: Message) -> None:
+    if not message.successful_payment or not message.from_user or not is_allowed(message.from_user.id):
+        return
+    payment = message.successful_payment
+    code = payment.invoice_payload.removeprefix("plan:")
+    plan = PLANS.get(code)
+    if not plan:
+        return
+    saved = await record_payment(
+        message.from_user.id,
+        code,
+        payment.telegram_payment_charge_id,
+        payment.total_amount,
+        plan["minutes"],
+        plan["actions"],
+    )
+    if saved:
+        await message.answer(
+            f"✅ Оплата прошла. Начислено: {plan['minutes']} минут и {plan['actions']} AI-действий.",
+            reply_markup=main_keyboard(),
+        )
+
+
+@router.message(Command("buy"))
+async def buy_command(message: Message) -> None:
+    if is_allowed(message.from_user.id if message.from_user else 0):
+        await message.answer("<b>Тарифы и оплата</b>\n\nВыберите пакет:", reply_markup=plans_keyboard())
+
+
+@router.message(Command("balance"))
+async def balance_command(message: Message) -> None:
+    if message.from_user and is_allowed(message.from_user.id):
+        minutes, actions = await get_balance(message.from_user.id)
+        await message.answer(f"<b>Баланс</b>\n\nМинуты: <b>{minutes}</b>\nAI-действия: <b>{actions}</b>", reply_markup=main_keyboard())
+
+
+@router.message(Command("paysupport"))
+async def paysupport_command(message: Message) -> None:
+    await message.answer("По вопросам оплаты напишите владельцу бота и приложите скриншот платежа и Telegram user ID.")
 
 
 @router.callback_query(F.data == "new")
@@ -482,10 +625,14 @@ async def privacy_callback(callback: CallbackQuery) -> None:
 
 @router.message(F.voice | F.audio | F.document | F.video)
 async def transcribe_message(message: Message, bot: Bot) -> None:
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if not is_allowed(user_id):
+        await message.answer("Доступ к боту пока не открыт для этого аккаунта.")
+        return
     details = audio_details(message)
     if not details:
         return
-    file_id, filename, file_size, is_video = details
+    file_id, filename, file_size, is_video, duration = details
     suffix = Path(filename).suffix.lower()
     if message.document and suffix not in SUPPORTED_AUDIO_SUFFIXES | SUPPORTED_VIDEO_SUFFIXES:
         await message.answer(
@@ -498,10 +645,20 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
     if is_rate_limited(message.from_user.id if message.from_user else 0):
         await message.answer("Лимит расшифровок на час исчерпан. Попробуйте немного позже.")
         return
-    user_id = message.from_user.id if message.from_user else message.chat.id
     language = await get_language(user_id)
     mode = await get_mode(user_id)
     conference = mode in {"conference", "summary"}
+    minutes_to_charge = max(1, math.ceil(duration / 60)) if duration else 1
+    actions_to_charge = 2 if mode == "summary" else 1 if mode == "conference" else 0
+    if not await charge_usage(user_id, minutes_to_charge, actions_to_charge):
+        await message.answer(
+            "Недостаточно минут или AI-действий для этой операции.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="plans")]]
+            ),
+        )
+        return
+    charged = True
 
     status = await message.answer("<b>Принято</b>\nСкачиваю запись…")
     try:
@@ -523,6 +680,8 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
         if summary:
             await message.answer("<b>Summary встречи</b>\n\n" + html.escape(summary), disable_web_page_preview=True)
     except Exception:
+        if charged:
+            await refund_usage(user_id, minutes_to_charge, actions_to_charge)
         logging.exception("transcription failed for chat %s", message.chat.id)
         await status.edit_text(
             "<b>Не удалось расшифровать</b>\n\n"
@@ -555,6 +714,9 @@ async def main() -> None:
             BotCommand(command="settings", description="Настройки языка"),
             BotCommand(command="privacy", description="Приватность"),
             BotCommand(command="menu", description="Показать меню"),
+            BotCommand(command="buy", description="Тарифы и оплата"),
+            BotCommand(command="balance", description="Мой баланс"),
+            BotCommand(command="paysupport", description="Помощь по оплате"),
         ]
     )
     await bot.delete_webhook(drop_pending_updates=False)
