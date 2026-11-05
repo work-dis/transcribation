@@ -1,4 +1,5 @@
 .env
+.env.transcriber
 .venv/
 __pycache__/
 *.py[cod]
