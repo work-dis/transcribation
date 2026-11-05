@@ -201,6 +201,21 @@ async def extract_audio(path: Path, temp_dir: str) -> tuple[Path, str]:
     return output, output.name
 
 
+async def probe_duration(path: Path) -> int | None:
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+    if process.returncode != 0:
+        return None
+    try:
+        return max(1, math.ceil(float(stdout.decode().strip())))
+    except (TypeError, ValueError):
+        return None
+
+
 async def transcribe_file(path: Path, filename: str, language: str = "ru", conference: bool = False) -> str:
     if not OPENROUTER_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
@@ -383,8 +398,6 @@ async def buy_callback(callback: CallbackQuery, bot: Bot) -> None:
         "currency": "XTR",
         "prices": [LabeledPrice(label=plan["title"], amount=plan["stars"])],
     }
-    if plan["monthly"]:
-        invoice_kwargs["subscription_period"] = 2592000
     await bot.send_invoice(**invoice_kwargs)
 
 
@@ -640,17 +653,9 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
     language = await get_language(user_id)
     mode = await get_mode(user_id)
     conference = mode in {"conference", "summary"}
-    minutes_to_charge = max(1, math.ceil(duration / 60)) if duration else 1
     actions_to_charge = 2 if mode == "summary" else 1 if mode == "conference" else 0
-    if not is_free_user(user_id) and not await charge_usage(user_id, minutes_to_charge, actions_to_charge):
-        await message.answer(
-            "Недостаточно минут или AI-действий для этой операции.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="plans")]]
-            ),
-        )
-        return
-    charged = not is_free_user(user_id)
+    minutes_to_charge = 0
+    charged = False
 
     status = await message.answer("<b>Принято</b>\nСкачиваю запись…")
     try:
@@ -663,6 +668,18 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
             with TemporaryDirectory(prefix="voicetype-") as temp_dir:
                 target = Path(temp_dir) / Path(filename).name
                 await bot.download_file(telegram_file.file_path, destination=target)
+                actual_duration = duration or await probe_duration(target)
+                minutes_to_charge = max(1, math.ceil(actual_duration / 60)) if actual_duration else 1
+                if not is_free_user(user_id) and not await charge_usage(user_id, minutes_to_charge, actions_to_charge):
+                    await status.delete()
+                    await message.answer(
+                        f"Недостаточно баланса: нужно примерно {minutes_to_charge} мин. и {actions_to_charge} AI-действий.",
+                        reply_markup=InlineKeyboardMarkup(
+                            inline_keyboard=[[InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="plans")]]
+                        ),
+                    )
+                    return
+                charged = not is_free_user(user_id)
                 audio_path, audio_name = await extract_audio(target, temp_dir) if is_video else (target, target.name)
                 transcript = await transcribe_file(audio_path, audio_name, language, conference)
             summary = await summarize_text(transcript) if mode == "summary" else ""
