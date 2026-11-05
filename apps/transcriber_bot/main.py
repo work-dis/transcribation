@@ -55,9 +55,9 @@ MAX_FILE_BYTES = int(os.environ.get("MAX_TRANSCRIPTION_FILE_MB", "20")) * 1024 *
 RATE_LIMIT_COUNT = int(os.environ.get("TRANSCRIPTION_RATE_LIMIT", "10"))
 RATE_LIMIT_WINDOW = 60 * 60
 MAX_TELEGRAM_TEXT = 4096
-ALLOWED_USER_IDS = {
+FREE_USER_IDS = {
     int(value.strip())
-    for value in os.environ.get("ALLOWED_USER_IDS", "").split(",")
+    for value in os.environ.get("FREE_USER_IDS", os.environ.get("ALLOWED_USER_IDS", "")).split(",")
     if value.strip().isdigit()
 }
 SUPPORTED_AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".webm", ".ogg", ".flac", ".aac"}
@@ -104,8 +104,8 @@ def menu_text() -> str:
     )
 
 
-def is_allowed(user_id: int) -> bool:
-    return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
+def is_free_user(user_id: int) -> bool:
+    return user_id in FREE_USER_IDS
 
 
 def plans_keyboard() -> InlineKeyboardMarkup:
@@ -299,9 +299,6 @@ async def send_transcript(message: Message, text: str) -> None:
 
 @router.message(CommandStart())
 async def start(message: Message) -> None:
-    if message.from_user and not is_allowed(message.from_user.id):
-        await message.answer("Доступ к боту пока не открыт для этого аккаунта.")
-        return
     await message.answer(
         menu_text(),
         reply_markup=main_keyboard(),
@@ -338,14 +335,14 @@ async def new_transcription(message: Message) -> None:
 @router.callback_query(F.data == "menu")
 async def menu_callback(callback: CallbackQuery) -> None:
     await callback.answer()
-    if callback.message and is_allowed(callback.from_user.id):
+    if callback.message:
         await callback.message.edit_text(menu_text(), reply_markup=main_keyboard())
 
 
 @router.callback_query(F.data == "plans")
 async def plans_callback(callback: CallbackQuery) -> None:
     await callback.answer()
-    if callback.message and is_allowed(callback.from_user.id):
+    if callback.message:
         await callback.message.edit_text(
             "<b>Тарифы и оплата</b>\n\nВыберите пакет. Оплата проходит в Telegram Stars, минуты и AI-действия не сгорают для разовой покупки.",
             reply_markup=plans_keyboard(),
@@ -355,7 +352,7 @@ async def plans_callback(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "balance")
 async def balance_callback(callback: CallbackQuery) -> None:
     await callback.answer()
-    if callback.message and is_allowed(callback.from_user.id):
+    if callback.message:
         minutes, actions = await get_balance(callback.from_user.id)
         await callback.message.edit_text(
             f"<b>Мой баланс</b>\n\nМинуты расшифровки: <b>{minutes}</b>\nAI-действия: <b>{actions}</b>",
@@ -371,7 +368,7 @@ async def balance_callback(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("buy:"))
 async def buy_callback(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
-    if not callback.message or not is_allowed(callback.from_user.id):
+    if not callback.message:
         return
     code = callback.data.split(":", 1)[1]
     plan = PLANS.get(code)
@@ -395,7 +392,7 @@ async def buy_callback(callback: CallbackQuery, bot: Bot) -> None:
 async def pre_checkout(query: PreCheckoutQuery) -> None:
     code = query.invoice_payload.removeprefix("plan:")
     plan = PLANS.get(code)
-    if not plan or not is_allowed(query.from_user.id) or query.total_amount != plan["stars"]:
+    if not plan or query.total_amount != plan["stars"]:
         await query.answer(ok=False, error_message="Тариф недоступен. Откройте меню оплаты ещё раз.")
         return
     await query.answer(ok=True)
@@ -403,7 +400,7 @@ async def pre_checkout(query: PreCheckoutQuery) -> None:
 
 @router.message(F.successful_payment)
 async def successful_payment(message: Message) -> None:
-    if not message.successful_payment or not message.from_user or not is_allowed(message.from_user.id):
+    if not message.successful_payment or not message.from_user:
         return
     payment = message.successful_payment
     code = payment.invoice_payload.removeprefix("plan:")
@@ -427,13 +424,12 @@ async def successful_payment(message: Message) -> None:
 
 @router.message(Command("buy"))
 async def buy_command(message: Message) -> None:
-    if is_allowed(message.from_user.id if message.from_user else 0):
-        await message.answer("<b>Тарифы и оплата</b>\n\nВыберите пакет:", reply_markup=plans_keyboard())
+    await message.answer("<b>Тарифы и оплата</b>\n\nВыберите пакет:", reply_markup=plans_keyboard())
 
 
 @router.message(Command("balance"))
 async def balance_command(message: Message) -> None:
-    if message.from_user and is_allowed(message.from_user.id):
+    if message.from_user:
         minutes, actions = await get_balance(message.from_user.id)
         await message.answer(f"<b>Баланс</b>\n\nМинуты: <b>{minutes}</b>\nAI-действия: <b>{actions}</b>", reply_markup=main_keyboard())
 
@@ -625,9 +621,6 @@ async def privacy_callback(callback: CallbackQuery) -> None:
 @router.message(F.voice | F.audio | F.document | F.video)
 async def transcribe_message(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id if message.from_user else message.chat.id
-    if not is_allowed(user_id):
-        await message.answer("Доступ к боту пока не открыт для этого аккаунта.")
-        return
     details = audio_details(message)
     if not details:
         return
@@ -649,7 +642,7 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
     conference = mode in {"conference", "summary"}
     minutes_to_charge = max(1, math.ceil(duration / 60)) if duration else 1
     actions_to_charge = 2 if mode == "summary" else 1 if mode == "conference" else 0
-    if not await charge_usage(user_id, minutes_to_charge, actions_to_charge):
+    if not is_free_user(user_id) and not await charge_usage(user_id, minutes_to_charge, actions_to_charge):
         await message.answer(
             "Недостаточно минут или AI-действий для этой операции.",
             reply_markup=InlineKeyboardMarkup(
@@ -657,7 +650,7 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
             ),
         )
         return
-    charged = True
+    charged = not is_free_user(user_id)
 
     status = await message.answer("<b>Принято</b>\nСкачиваю запись…")
     try:
