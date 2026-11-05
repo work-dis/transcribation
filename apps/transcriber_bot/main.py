@@ -23,8 +23,11 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     Message,
 )
+from apps.transcriber_bot.storage import get_language, init_db, recent_transcriptions, save_transcription, set_language
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -46,6 +49,28 @@ def main_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Как это работает", callback_data="help")],
             [InlineKeyboardButton(text="Приватность", callback_data="privacy")],
+        ]
+    )
+
+
+def reply_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎙 Новая расшифровка"), KeyboardButton(text="🕘 История")],
+            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="🔒 Приватность")],
+            [KeyboardButton(text="❓ Помощь")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Отправьте голосовое сообщение",
+    )
+
+
+def language_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=("✅ Русский" if language == "ru" else "Русский"), callback_data="lang:ru")],
+            [InlineKeyboardButton(text=("✅ Автоопределение" if language == "auto" else "Автоопределение"), callback_data="lang:auto")],
         ]
     )
 
@@ -76,11 +101,11 @@ def audio_details(message: Message) -> tuple[str, str, int | None] | None:
     return voice.file_id, filename, voice.file_size
 
 
-async def transcribe_file(path: Path, filename: str) -> str:
+async def transcribe_file(path: Path, filename: str, language: str = "ru") -> str:
     if not OPENROUTER_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
     with path.open("rb") as audio:
-        response = await _post_transcription(audio, filename, _mime_for(filename))
+        response = await _post_transcription(audio, filename, _mime_for(filename), language)
     if response.status_code >= 400:
         detail = response.text[:400].replace("\n", " ")
         raise RuntimeError(f"OpenRouter returned {response.status_code}: {detail}")
@@ -91,12 +116,13 @@ async def transcribe_file(path: Path, filename: str) -> str:
     return text
 
 
-async def _post_transcription(audio: Any, filename: str, mime_type: str) -> httpx.Response:
+async def _post_transcription(audio: Any, filename: str, mime_type: str, language: str = "ru") -> httpx.Response:
     data = {
         "model": TRANSCRIPTION_MODEL,
-        "language": "ru",
         "response_format": "json",
     }
+    if language != "auto":
+        data["language"] = language
     files = {"file": (filename, audio, mime_type)}
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
@@ -129,7 +155,7 @@ async def start(message: Message) -> None:
         "<b>VoiceType</b>\n\n"
         "Отправьте голосовое сообщение — я превращу его в аккуратный русский текст.\n\n"
         "<i>Аудио обрабатывается только для текущей расшифровки и затем удаляется.</i>",
-        reply_markup=main_keyboard(),
+        reply_markup=reply_menu(),
     )
 
 
@@ -141,8 +167,76 @@ async def help_command(message: Message) -> None:
         "2. Отправьте сообщение в этот чат.\n"
         "3. Через несколько секунд получите текст.\n\n"
         "Поддерживаются голосовые сообщения и аудиофайлы до 20 МБ.",
-        reply_markup=main_keyboard(),
+        reply_markup=reply_menu(),
     )
+
+
+@router.message(Command("menu"))
+@router.message(F.text.in_({"❓ Помощь", "Помощь"}))
+async def menu_command(message: Message) -> None:
+    await help_command(message)
+
+
+@router.message(Command("new"))
+@router.message(F.text.in_({"🎙 Новая расшифровка", "Новая расшифровка"}))
+async def new_transcription(message: Message) -> None:
+    await message.answer(
+        "Готово. Отправьте голосовое сообщение или аудиофайл — я верну текст.",
+        reply_markup=reply_menu(),
+    )
+
+
+@router.message(Command("privacy"))
+@router.message(F.text.in_({"🔒 Приватность", "Приватность"}))
+async def privacy_command(message: Message) -> None:
+    await message.answer(
+        "<b>Приватность</b>\n\n"
+        "Аудио временно передаётся в OpenRouter для распознавания и удаляется после обработки.\n"
+        "В боте сохраняются только последние 20 текстовых расшифровок, чтобы была доступна история.\n\n"
+        "Не отправляйте секретные данные, если для них не согласован внешний AI-провайдер.",
+        reply_markup=reply_menu(),
+    )
+
+
+@router.message(Command("settings"))
+@router.message(F.text.in_({"⚙️ Настройки", "Настройки"}))
+async def settings_command(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    language = await get_language(user_id)
+    label = "русский" if language == "ru" else "автоопределение"
+    await message.answer(
+        f"<b>Настройки</b>\n\nЯзык распознавания: <b>{label}</b>\n\nВыберите режим:",
+        reply_markup=language_keyboard(language),
+    )
+
+
+@router.callback_query(F.data.startswith("lang:"))
+async def language_callback(callback: CallbackQuery) -> None:
+    await callback.answer("Настройка сохранена")
+    if not callback.from_user or not callback.message:
+        return
+    language = callback.data.split(":", 1)[1]
+    await set_language(callback.from_user.id, language)
+    label = "русский" if language == "ru" else "автоопределение"
+    await callback.message.edit_text(
+        f"<b>Настройки</b>\n\nЯзык распознавания: <b>{label}</b>",
+        reply_markup=language_keyboard(language),
+    )
+
+
+@router.message(Command("history"))
+@router.message(F.text.in_({"🕘 История", "История"}))
+async def history_command(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    rows = await recent_transcriptions(user_id)
+    if not rows:
+        await message.answer("История пока пуста. Отправьте первое голосовое сообщение.", reply_markup=reply_menu())
+        return
+    lines = ["<b>Последние расшифровки</b>", ""]
+    for created_at, text in rows:
+        preview = html.escape(text.replace("\n", " ")[:240])
+        lines.append(f"<i>{html.escape(created_at[5:16])}</i>\n{preview}")
+    await message.answer("\n\n".join(lines), reply_markup=reply_menu())
 
 
 @router.callback_query(F.data == "help")
@@ -182,6 +276,8 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
     if is_rate_limited(message.from_user.id if message.from_user else 0):
         await message.answer("Лимит расшифровок на час исчерпан. Попробуйте немного позже.")
         return
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    language = await get_language(user_id)
 
     status = await message.answer("<b>Принято</b>\nСкачиваю аудио…")
     try:
@@ -193,7 +289,8 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
             with TemporaryDirectory(prefix="voicetype-") as temp_dir:
                 target = Path(temp_dir) / Path(filename).name
                 await bot.download_file(telegram_file.file_path, destination=target)
-                transcript = await transcribe_file(target, target.name)
+                transcript = await transcribe_file(target, target.name, language)
+        await save_transcription(user_id, message.chat.id, transcript)
         await status.delete()
         await send_transcript(message, transcript)
     except Exception:
@@ -206,7 +303,7 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
 
 @router.message()
 async def unsupported_message(message: Message) -> None:
-    await message.answer("Отправьте голосовое сообщение — я превращу его в текст.", reply_markup=main_keyboard())
+    await message.answer("Отправьте голосовое сообщение — я превращу его в текст.", reply_markup=reply_menu())
 
 
 async def main() -> None:
@@ -216,6 +313,7 @@ async def main() -> None:
         raise RuntimeError("OPENROUTER_API_KEY is required")
 
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+    await init_db()
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
@@ -223,6 +321,11 @@ async def main() -> None:
         [
             BotCommand(command="start", description="Открыть VoiceType"),
             BotCommand(command="help", description="Как пользоваться"),
+            BotCommand(command="new", description="Новая расшифровка"),
+            BotCommand(command="history", description="История расшифровок"),
+            BotCommand(command="settings", description="Настройки языка"),
+            BotCommand(command="privacy", description="Приватность"),
+            BotCommand(command="menu", description="Показать меню"),
         ]
     )
     await bot.delete_webhook(drop_pending_updates=False)
