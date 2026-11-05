@@ -101,7 +101,7 @@ async def _post_transcription(audio: Any, filename: str, mime_type: str) -> http
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
         "HTTP-Referer": WEB_BASE_URL,
-        "X-Title": "VoiceType — Russian transcription bot",
+        "X-Title": "VoiceType Russian transcription bot",
     }
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=20.0)) as client:
         return await client.post(f"{OPENROUTER_BASE_URL}/audio/transcriptions", headers=headers, data=data, files=files)
