@@ -64,9 +64,9 @@ SUPPORTED_AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".webm", ".ogg", ".flac", ".
 SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 
 PLANS = {
-    "monthly_5": {"title": "5 часов + 60 AI-действий / месяц", "stars": 235, "minutes": 300, "actions": 60, "monthly": True},
-    "monthly_12": {"title": "12 часов + 300 AI-действий / месяц", "stars": 475, "minutes": 720, "actions": 300, "monthly": True},
-    "monthly_40": {"title": "40 часов + 1000 AI-действий / месяц", "stars": 1425, "minutes": 2400, "actions": 1000, "monthly": True},
+    "monthly_5": {"title": "Пакет: 5 часов + 60 AI-действий", "stars": 235, "minutes": 300, "actions": 60, "monthly": False},
+    "monthly_12": {"title": "Пакет: 12 часов + 300 AI-действий", "stars": 475, "minutes": 720, "actions": 300, "monthly": False},
+    "monthly_40": {"title": "Пакет: 40 часов + 1000 AI-действий", "stars": 1425, "minutes": 2400, "actions": 1000, "monthly": False},
     "one_1": {"title": "1 час + 60 AI-действий", "stars": 235, "minutes": 60, "actions": 60, "monthly": False},
     "one_3": {"title": "3 часа + 180 AI-действий", "stars": 475, "minutes": 180, "actions": 180, "monthly": False},
     "one_10": {"title": "10 часов + 600 AI-действий", "stars": 1425, "minutes": 600, "actions": 600, "monthly": False},
@@ -88,7 +88,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
                 InlineKeyboardButton(text="🔒 Приватность", callback_data="privacy"),
             ],
-            [InlineKeyboardButton(text="🗣 Конференция и summary", callback_data="conference")],
+            [InlineKeyboardButton(text="📝 Режим обработки", callback_data="conference")],
             [InlineKeyboardButton(text="💳 Тарифы и оплата", callback_data="plans")],
             [InlineKeyboardButton(text="💰 Мой баланс", callback_data="balance")],
             [InlineKeyboardButton(text="❓ Как пользоваться", callback_data="help")],
@@ -111,9 +111,9 @@ def is_free_user(user_id: int) -> bool:
 def plans_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="5 ч + 60 AI / месяц — 235 ⭐", callback_data="buy:monthly_5")],
-            [InlineKeyboardButton(text="12 ч + 300 AI / месяц — 475 ⭐", callback_data="buy:monthly_12")],
-            [InlineKeyboardButton(text="40 ч + 1000 AI / месяц — 1425 ⭐", callback_data="buy:monthly_40")],
+            [InlineKeyboardButton(text="Пакет 5 ч + 60 AI — 235 ⭐", callback_data="buy:monthly_5")],
+            [InlineKeyboardButton(text="Пакет 12 ч + 300 AI — 475 ⭐", callback_data="buy:monthly_12")],
+            [InlineKeyboardButton(text="Пакет 40 ч + 1000 AI — 1425 ⭐", callback_data="buy:monthly_40")],
             [InlineKeyboardButton(text="1 ч + 60 AI — 235 ⭐", callback_data="buy:one_1")],
             [InlineKeyboardButton(text="3 ч + 180 AI — 475 ⭐", callback_data="buy:one_3")],
             [InlineKeyboardButton(text="10 ч + 600 AI — 1425 ⭐", callback_data="buy:one_10")],
@@ -151,8 +151,8 @@ def mode_keyboard(mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=label("quick", "Быстрая расшифровка"), callback_data="mode:quick")],
-            [InlineKeyboardButton(text=label("conference", "По ролям"), callback_data="mode:conference")],
-            [InlineKeyboardButton(text=label("summary", "По ролям + summary"), callback_data="mode:summary")],
+            [InlineKeyboardButton(text=label("conference", "С разделением по участникам"), callback_data="mode:conference")],
+            [InlineKeyboardButton(text=label("summary", "С разделением и итогами"), callback_data="mode:summary")],
             [InlineKeyboardButton(text="← Главное меню", callback_data="menu")],
         ]
     )
@@ -474,9 +474,10 @@ async def history_callback(callback: CallbackQuery) -> None:
         text = "<b>История</b>\n\nПока здесь пусто. Отправьте первое голосовое сообщение."
     else:
         lines = ["<b>Последние расшифровки</b>", ""]
-        for created_at, transcript in rows:
+        for created_at, transcript, summary in rows:
             preview = html.escape(transcript.replace("\n", " ")[:240])
-            lines.append(f"<i>{html.escape(created_at[5:16])}</i>\n{preview}")
+            suffix = "\n<i>Есть итоги встречи</i>" if summary else ""
+            lines.append(f"<i>{html.escape(created_at[5:16])}</i>\n{preview}{suffix}")
         text = "\n\n".join(lines)
     await callback.message.edit_text(
         text,
@@ -510,8 +511,8 @@ async def settings_callback(callback: CallbackQuery) -> None:
 def mode_label(mode: str) -> str:
     return {
         "quick": "быстрая расшифровка",
-        "conference": "по ролям",
-        "summary": "по ролям + summary",
+        "conference": "с разделением по участникам",
+        "summary": "с разделением и итогами",
     }.get(mode, "быстрая расшифровка")
 
 
@@ -522,10 +523,10 @@ async def conference_callback(callback: CallbackQuery) -> None:
         return
     mode = await get_mode(callback.from_user.id)
     await callback.message.edit_text(
-        "<b>Режим конференции</b>\n\n"
+        "<b>Режим обработки</b>\n\n"
         "Выберите, как обрабатывать записи встреч и Zoom:\n\n"
-        "<b>По ролям</b> — разделить текст по говорящим.\n"
-        "<b>По ролям + summary</b> — разделить по говорящим и подготовить итоги, решения и задачи.",
+        "<b>С разделением по участникам</b> — реплики будут сгруппированы отдельно.\n"
+        "<b>С разделением и итогами</b> — добавим краткое содержание, решения и задачи.",
         reply_markup=mode_keyboard(mode),
     )
 
@@ -584,7 +585,7 @@ async def language_callback(callback: CallbackQuery) -> None:
         f"<b>Настройки</b>\n\nЯзык распознавания: <b>{label}</b>",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🎛 Режим конференции", callback_data="conference")],
+                [InlineKeyboardButton(text="📝 Режим обработки", callback_data="conference")],
                 [InlineKeyboardButton(text="← Главное меню", callback_data="menu")],
             ]
         ),
@@ -600,9 +601,10 @@ async def history_command(message: Message) -> None:
         await message.answer("История пока пуста. Отправьте первое голосовое сообщение.", reply_markup=reply_menu())
         return
     lines = ["<b>Последние расшифровки</b>", ""]
-    for created_at, text in rows:
+    for created_at, text, summary in rows:
         preview = html.escape(text.replace("\n", " ")[:240])
-        lines.append(f"<i>{html.escape(created_at[5:16])}</i>\n{preview}")
+        suffix = "\n<i>Есть итоги встречи</i>" if summary else ""
+        lines.append(f"<i>{html.escape(created_at[5:16])}</i>\n{preview}{suffix}")
     await message.answer("\n\n".join(lines), reply_markup=reply_menu())
 
 
@@ -682,12 +684,17 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
                 charged = not is_free_user(user_id)
                 audio_path, audio_name = await extract_audio(target, temp_dir) if is_video else (target, target.name)
                 transcript = await transcribe_file(audio_path, audio_name, language, conference)
-            summary = await summarize_text(transcript) if mode == "summary" else ""
-        await save_transcription(user_id, message.chat.id, transcript)
+            summary = ""
+            if mode == "summary":
+                try:
+                    summary = await summarize_text(transcript)
+                except Exception:
+                    logging.exception("summary failed for chat %s", message.chat.id)
+        await save_transcription(user_id, message.chat.id, transcript, summary)
         await status.delete()
         await send_transcript(message, transcript)
         if summary:
-            await message.answer("<b>Summary встречи</b>\n\n" + html.escape(summary), disable_web_page_preview=True)
+            await message.answer("<b>Итоги встречи</b>\n\n" + html.escape(summary), disable_web_page_preview=True)
     except Exception:
         if charged:
             await refund_usage(user_id, minutes_to_charge, actions_to_charge)
@@ -729,7 +736,7 @@ async def main() -> None:
         ]
     )
     await bot.delete_webhook(drop_pending_updates=False)
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "pre_checkout_query"])
 
 
 if __name__ == "__main__":

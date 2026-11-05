@@ -23,6 +23,7 @@ async def init_db() -> None:
                 user_id INTEGER NOT NULL,
                 chat_id INTEGER NOT NULL,
                 text TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS balances (
@@ -48,6 +49,10 @@ async def init_db() -> None:
         columns = {row[1] for row in await cursor.fetchall()}
         if "mode" not in columns:
             await db.execute("ALTER TABLE user_settings ADD COLUMN mode TEXT NOT NULL DEFAULT 'quick'")
+        cursor = await db.execute("PRAGMA table_info(transcriptions)")
+        transcription_columns = {row[1] for row in await cursor.fetchall()}
+        if "summary" not in transcription_columns:
+            await db.execute("ALTER TABLE transcriptions ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
         await db.commit()
 
 
@@ -89,11 +94,11 @@ async def set_mode(user_id: int, mode: str) -> None:
         await db.commit()
 
 
-async def save_transcription(user_id: int, chat_id: int, text: str) -> None:
+async def save_transcription(user_id: int, chat_id: int, text: str, summary: str = "") -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO transcriptions(user_id, chat_id, text) VALUES (?, ?, ?)",
-            (user_id, chat_id, text),
+            "INSERT INTO transcriptions(user_id, chat_id, text, summary) VALUES (?, ?, ?, ?)",
+            (user_id, chat_id, text, summary),
         )
         cursor = await db.execute(
             "SELECT id FROM transcriptions WHERE user_id = ? "
@@ -106,10 +111,10 @@ async def save_transcription(user_id: int, chat_id: int, text: str) -> None:
         await db.commit()
 
 
-async def recent_transcriptions(user_id: int, limit: int = 5) -> list[tuple[str, str]]:
+async def recent_transcriptions(user_id: int, limit: int = 5) -> list[tuple[str, str, str]]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT created_at, text FROM transcriptions WHERE user_id = ? "
+            "SELECT created_at, text, summary FROM transcriptions WHERE user_id = ? "
             "ORDER BY created_at DESC, id DESC LIMIT ?",
             (user_id, limit),
         )
