@@ -385,7 +385,6 @@ async def buy_callback(callback: CallbackQuery, bot: Bot) -> None:
         "payload": f"plan:{code}",
         "currency": "XTR",
         "prices": [LabeledPrice(label=plan["title"], amount=plan["stars"])],
-        "provider_token": "",
     }
     if plan["monthly"]:
         invoice_kwargs["subscription_period"] = 2592000
