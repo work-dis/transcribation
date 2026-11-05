@@ -12,6 +12,7 @@ RUN apt-get update \
 COPY apps/transcriber_bot ./apps/transcriber_bot
 
 RUN useradd --create-home --uid 10001 appuser
+RUN mkdir -p /data && chown -R 10001:10001 /data
 USER appuser
 
 CMD ["python", "-m", "apps.transcriber_bot.main"]
