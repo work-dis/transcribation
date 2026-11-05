@@ -15,7 +15,8 @@ async def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id INTEGER PRIMARY KEY,
-                language TEXT NOT NULL DEFAULT 'ru'
+                language TEXT NOT NULL DEFAULT 'ru',
+                mode TEXT NOT NULL DEFAULT 'quick'
             );
             CREATE TABLE IF NOT EXISTS transcriptions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,6 +29,10 @@ async def init_db() -> None:
                 ON transcriptions(user_id, created_at DESC);
             """
         )
+        cursor = await db.execute("PRAGMA table_info(user_settings)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "mode" not in columns:
+            await db.execute("ALTER TABLE user_settings ADD COLUMN mode TEXT NOT NULL DEFAULT 'quick'")
         await db.commit()
 
 
@@ -46,6 +51,25 @@ async def set_language(user_id: int, language: str) -> None:
             "INSERT INTO user_settings(user_id, language) VALUES (?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET language = excluded.language",
             (user_id, language),
+        )
+        await db.commit()
+
+
+async def get_mode(user_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT mode FROM user_settings WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+    return row[0] if row and row[0] in {"quick", "conference", "summary"} else "quick"
+
+
+async def set_mode(user_id: int, mode: str) -> None:
+    if mode not in {"quick", "conference", "summary"}:
+        mode = "quick"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO user_settings(user_id, mode) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET mode = excluded.mode",
+            (user_id, mode),
         )
         await db.commit()
 

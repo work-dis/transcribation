@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import time
@@ -29,12 +30,22 @@ from aiogram.types import (
     Message,
     Video,
 )
-from apps.transcriber_bot.storage import get_language, init_db, recent_transcriptions, save_transcription, set_language
+from apps.transcriber_bot.storage import (
+    get_language,
+    get_mode,
+    init_db,
+    recent_transcriptions,
+    save_transcription,
+    set_language,
+    set_mode,
+)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 TRANSCRIPTION_MODEL = os.environ.get("TRANSCRIPTION_MODEL", "openai/whisper-large-v3-turbo")
+CONFERENCE_MODEL = os.environ.get("CONFERENCE_MODEL", "elevenlabs/scribe-v2")
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "openai/gpt-4o-mini")
 WEB_BASE_URL = os.environ.get("WEB_BASE_URL", "https://telegram.org")
 MAX_FILE_BYTES = int(os.environ.get("MAX_TRANSCRIPTION_FILE_MB", "20")) * 1024 * 1024
 RATE_LIMIT_COUNT = int(os.environ.get("TRANSCRIPTION_RATE_LIMIT", "10"))
@@ -59,6 +70,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
                 InlineKeyboardButton(text="🔒 Приватность", callback_data="privacy"),
             ],
+            [InlineKeyboardButton(text="🗣 Конференция и summary", callback_data="conference")],
             [InlineKeyboardButton(text="❓ Как пользоваться", callback_data="help")],
         ]
     )
@@ -90,6 +102,20 @@ def language_keyboard(language: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text=("✅ Русский" if language == "ru" else "Русский"), callback_data="lang:ru")],
             [InlineKeyboardButton(text=("✅ Автоопределение" if language == "auto" else "Автоопределение"), callback_data="lang:auto")],
+        ]
+    )
+
+
+def mode_keyboard(mode: str) -> InlineKeyboardMarkup:
+    def label(value: str, text: str) -> str:
+        return f"✅ {text}" if mode == value else text
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=label("quick", "Быстрая расшифровка"), callback_data="mode:quick")],
+            [InlineKeyboardButton(text=label("conference", "По ролям"), callback_data="mode:conference")],
+            [InlineKeyboardButton(text=label("summary", "По ролям + summary"), callback_data="mode:summary")],
+            [InlineKeyboardButton(text="← Главное меню", callback_data="menu")],
         ]
     )
 
@@ -137,28 +163,50 @@ async def extract_audio(path: Path, temp_dir: str) -> tuple[Path, str]:
     return output, output.name
 
 
-async def transcribe_file(path: Path, filename: str, language: str = "ru") -> str:
+async def transcribe_file(path: Path, filename: str, language: str = "ru", conference: bool = False) -> str:
     if not OPENROUTER_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
     with path.open("rb") as audio:
-        response = await _post_transcription(audio, filename, _mime_for(filename), language)
+        response = await _post_transcription(audio, filename, _mime_for(filename), language, conference)
     if response.status_code >= 400:
         detail = response.text[:400].replace("\n", " ")
         raise RuntimeError(f"OpenRouter returned {response.status_code}: {detail}")
     payload = response.json()
-    text = str(payload.get("text") or "").strip()
+    text = _format_diarized(payload) if conference else str(payload.get("text") or "").strip()
     if not text:
         raise RuntimeError("OpenRouter returned empty transcription")
     return text
 
 
-async def _post_transcription(audio: Any, filename: str, mime_type: str, language: str = "ru") -> httpx.Response:
+def _format_diarized(payload: dict[str, Any]) -> str:
+    words = payload.get("words") or []
+    turns: list[tuple[str, list[str]]] = []
+    for item in words:
+        word = str(item.get("word") or "").strip()
+        speaker = str(item.get("speaker_label") or item.get("speaker") or "1")
+        if not word:
+            continue
+        speaker = f"Спикер {speaker.replace('speaker_', '')}"
+        if turns and turns[-1][0] == speaker:
+            turns[-1][1].append(word)
+        else:
+            turns.append((speaker, [word]))
+    if turns:
+        return "\n\n".join(f"{speaker}: {' '.join(words)}" for speaker, words in turns)
+    return str(payload.get("text") or "").strip()
+
+
+async def _post_transcription(
+    audio: Any, filename: str, mime_type: str, language: str = "ru", conference: bool = False
+) -> httpx.Response:
     data = {
-        "model": TRANSCRIPTION_MODEL,
-        "response_format": "json",
+        "model": CONFERENCE_MODEL if conference else TRANSCRIPTION_MODEL,
+        "response_format": "verbose_json" if conference else "json",
     }
     if language != "auto":
         data["language"] = language
+    if conference:
+        data["provider"] = json.dumps({"options": {"elevenlabs": {"diarize": True, "tag_audio_events": True}}})
     files = {"file": (filename, audio, mime_type)}
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
@@ -167,6 +215,30 @@ async def _post_transcription(audio: Any, filename: str, mime_type: str, languag
     }
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=20.0)) as client:
         return await client.post(f"{OPENROUTER_BASE_URL}/audio/transcriptions", headers=headers, data=data, files=files)
+
+
+async def summarize_text(transcript: str) -> str:
+    prompt = (
+        "Сделай краткое структурированное summary встречи на русском языке. "
+        "Выдели: 1) краткий итог, 2) ключевые решения, 3) задачи и ответственных, если они названы, "
+        "4) открытые вопросы. Не выдумывай отсутствующие данные.\n\n" + transcript
+    )
+    headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "HTTP-Referer": WEB_BASE_URL, "X-Title": "VoiceType meeting summary"}
+    payload = {
+        "model": SUMMARY_MODEL,
+        "messages": [
+            {"role": "system", "content": "Ты аккуратный секретарь встреч."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+    }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=20.0)) as client:
+        response = await client.post(f"{OPENROUTER_BASE_URL}/chat/completions", headers=headers, json=payload)
+    if response.status_code >= 400:
+        detail = response.text[:300].replace("\n", " ")
+        raise RuntimeError(f"Summary failed {response.status_code}: {detail}")
+    result = response.json()
+    return str(result["choices"][0]["message"]["content"]).strip()
 
 
 def _mime_for(filename: str) -> str:
@@ -269,13 +341,56 @@ async def settings_callback(callback: CallbackQuery) -> None:
     if not callback.from_user or not callback.message:
         return
     language = await get_language(callback.from_user.id)
+    mode = await get_mode(callback.from_user.id)
     label = "русский" if language == "ru" else "автоопределение"
     await callback.message.edit_text(
-        f"<b>Настройки</b>\n\nЯзык распознавания: <b>{label}</b>\n\nВыберите режим:",
+        f"<b>Настройки</b>\n\nЯзык: <b>{label}</b>\nРежим: <b>{mode_label(mode)}</b>",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=("✅ Русский" if language == "ru" else "Русский"), callback_data="lang:ru")],
                 [InlineKeyboardButton(text=("✅ Автоопределение" if language == "auto" else "Автоопределение"), callback_data="lang:auto")],
+                [InlineKeyboardButton(text="🎛 Изменить режим", callback_data="conference")],
+                [InlineKeyboardButton(text="← Главное меню", callback_data="menu")],
+            ]
+        ),
+    )
+
+
+def mode_label(mode: str) -> str:
+    return {
+        "quick": "быстрая расшифровка",
+        "conference": "по ролям",
+        "summary": "по ролям + summary",
+    }.get(mode, "быстрая расшифровка")
+
+
+@router.callback_query(F.data == "conference")
+async def conference_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if not callback.from_user or not callback.message:
+        return
+    mode = await get_mode(callback.from_user.id)
+    await callback.message.edit_text(
+        "<b>Режим конференции</b>\n\n"
+        "Выберите, как обрабатывать записи встреч и Zoom:\n\n"
+        "<b>По ролям</b> — разделить текст по говорящим.\n"
+        "<b>По ролям + summary</b> — разделить по говорящим и подготовить итоги, решения и задачи.",
+        reply_markup=mode_keyboard(mode),
+    )
+
+
+@router.callback_query(F.data.startswith("mode:"))
+async def mode_callback(callback: CallbackQuery) -> None:
+    await callback.answer("Режим сохранён")
+    if not callback.from_user or not callback.message:
+        return
+    mode = callback.data.split(":", 1)[1]
+    await set_mode(callback.from_user.id, mode)
+    await callback.message.edit_text(
+        f"<b>Режим сохранён</b>\n\nТеперь записи будут обрабатываться так: <b>{mode_label(mode)}</b>.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🎙 Отправить запись", callback_data="new")],
                 [InlineKeyboardButton(text="← Главное меню", callback_data="menu")],
             ]
         ),
@@ -316,7 +431,12 @@ async def language_callback(callback: CallbackQuery) -> None:
     label = "русский" if language == "ru" else "автоопределение"
     await callback.message.edit_text(
         f"<b>Настройки</b>\n\nЯзык распознавания: <b>{label}</b>",
-        reply_markup=language_keyboard(language),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🎛 Режим конференции", callback_data="conference")],
+                [InlineKeyboardButton(text="← Главное меню", callback_data="menu")],
+            ]
+        ),
     )
 
 
@@ -380,11 +500,14 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
         return
     user_id = message.from_user.id if message.from_user else message.chat.id
     language = await get_language(user_id)
+    mode = await get_mode(user_id)
+    conference = mode in {"conference", "summary"}
 
     status = await message.answer("<b>Принято</b>\nСкачиваю запись…")
     try:
         async with processing_slots:
-            await status.edit_text("<b>В работе</b>\nРаспознаю русскую речь…")
+            stage = "Распознаю речь и разделяю по говорящим…" if conference else "Распознаю русскую речь…"
+            await status.edit_text(f"<b>В работе</b>\n{stage}")
             telegram_file = await bot.get_file(file_id)
             if not telegram_file.file_path:
                 raise RuntimeError("Telegram did not return a file path")
@@ -392,10 +515,13 @@ async def transcribe_message(message: Message, bot: Bot) -> None:
                 target = Path(temp_dir) / Path(filename).name
                 await bot.download_file(telegram_file.file_path, destination=target)
                 audio_path, audio_name = await extract_audio(target, temp_dir) if is_video else (target, target.name)
-                transcript = await transcribe_file(audio_path, audio_name, language)
+                transcript = await transcribe_file(audio_path, audio_name, language, conference)
+            summary = await summarize_text(transcript) if mode == "summary" else ""
         await save_transcription(user_id, message.chat.id, transcript)
         await status.delete()
         await send_transcript(message, transcript)
+        if summary:
+            await message.answer("<b>Summary встречи</b>\n\n" + html.escape(summary), disable_web_page_preview=True)
     except Exception:
         logging.exception("transcription failed for chat %s", message.chat.id)
         await status.edit_text(
