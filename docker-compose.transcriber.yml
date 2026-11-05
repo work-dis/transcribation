@@ -1,4 +1,16 @@
 services:
+  miniapp-api:
+    build: .
+    command: uvicorn apps.miniapp_api:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    env_file:
+      - .env.transcriber
+    environment:
+      TRANSCRIBER_DB_PATH: /data/voicetype.db
+    volumes:
+      - transcriber-data:/data
+    ports:
+      - "127.0.0.1:8000:8000"
   transcriber-bot:
     build:
       context: .
@@ -12,6 +24,8 @@ services:
       - /tmp:size=128m,noexec,nosuid
     volumes:
       - transcriber-data:/data
+    depends_on:
+      - miniapp-api
     mem_limit: 384m
     cpus: 0.50
 
