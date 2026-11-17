@@ -48,7 +48,7 @@ from apps.transcriber_bot.storage import charge_usage, get_balance, record_payme
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-TRANSCRIPTION_MODEL = os.environ.get("TRANSCRIPTION_MODEL", "openai/whisper-large-v3-turbo")
+TRANSCRIPTION_MODEL = os.environ.get("TRANSCRIPTION_MODEL", "elevenlabs/scribe-v2")
 CONFERENCE_MODEL = os.environ.get("CONFERENCE_MODEL", "elevenlabs/scribe-v2")
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "openai/gpt-4o-mini")
 WEB_BASE_URL = os.environ.get("WEB_BASE_URL", "https://telegram.org")

@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     telegram_recorder_display_name: str = "Conversation Assistant"
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    transcription_model: str = "openai/whisper-large-v3-turbo"
+    transcription_model: str = "elevenlabs/scribe-v2"
     analysis_model: str = "deepseek/deepseek-v4.1-flash"
     openrouter_require_zdr: bool = False
     openrouter_allow_training: bool = False
